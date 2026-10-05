@@ -1,7 +1,7 @@
 gsap.registerPlugin(ScrollTrigger);
 
 /* =========================================================
-   1. CINEMATIC CANVAS HERO (LIGHTNING FAST 2-PASS PRELOADER)
+   1. CINEMATIC CANVAS HERO (ON-DEMAND FRAME LOADING)
    ========================================================= */
 const canvas = document.getElementById("cinematic-canvas");
 const context = canvas ? canvas.getContext("2d", { alpha: false }) : null;
@@ -16,6 +16,15 @@ const heroFrameFiles = [...frameFiles].sort((first, second) => {
 const TOTAL_FRAMES = heroFrameFiles.length;
 const pxPerFrame = 10;
 const images = [];
+const loadingFrames = new Set();
+const queuedFrames = new Set();
+const failedFrames = new Set();
+const loadedFrameOrder = [];
+const MAX_CONCURRENT_FRAME_LOADS = 4;
+const MAX_CACHED_FRAMES = 24;
+const FRAME_PREFETCH_RADIUS = 3;
+let currentFrameIndex = 1;
+let targetFrameIndex = 1;
 
 if (heroWrap) {
   heroWrap.style.height = `${TOTAL_FRAMES * pxPerFrame}px`;
@@ -30,7 +39,7 @@ function resizeCanvas() {
 }
 
 function renderFrame(img) {
-  if (!canvas || !context || !img || !img.complete) return;
+  if (!canvas || !context || !img || !img.complete || !img.naturalWidth) return;
   const canvasRatio = canvas.width / canvas.height;
   const imgRatio = img.width / img.height;
   let drawWidth, drawHeight;
@@ -51,78 +60,90 @@ function renderFrame(img) {
 
 function getClosestLoadedImage(targetIdx) {
   const rounded = Math.round(targetIdx);
-  if (images[rounded] && images[rounded].complete) {
+  if (images[rounded] && images[rounded].complete && images[rounded].naturalWidth) {
     return images[rounded];
   }
-  for (let offset = 1; offset < 30; offset++) {
+  for (let offset = 1; offset <= TOTAL_FRAMES; offset++) {
     const prev = rounded - offset;
-    if (prev >= 1 && images[prev] && images[prev].complete) {
+    if (prev >= 1 && images[prev] && images[prev].complete && images[prev].naturalWidth) {
       return images[prev];
     }
     const next = rounded + offset;
-    if (next <= TOTAL_FRAMES && images[next] && images[next].complete) {
+    if (next <= TOTAL_FRAMES && images[next] && images[next].complete && images[next].naturalWidth) {
       return images[next];
     }
   }
   return null;
 }
 
-// PASS 1: Eager keyframes (every 3rd frame) for instant 3x fast load speed
-const KEYFRAME_STEP = 3;
-let pass1Index = 1;
-
-function preloadPass1Keyframes() {
-  if (pass1Index > TOTAL_FRAMES) {
-    // Start Pass 2 background fill once keyframes are in
-    preloadPass2Fill();
-    if (typeof ScrollTrigger !== 'undefined') ScrollTrigger.refresh();
-    return;
-  }
-  const idx = pass1Index;
-  const img = new Image();
-  img.src = heroFrameFiles[idx - 1];
-  img.onload = () => {
-    images[idx] = img;
-    if (idx === 1) {
-      resizeCanvas();
-      renderFrame(img);
+function pumpFrameLoads() {
+  while (loadingFrames.size < MAX_CONCURRENT_FRAME_LOADS) {
+    const candidates = [...queuedFrames].filter(
+      index => Math.abs(index - targetFrameIndex) <= FRAME_PREFETCH_RADIUS
+    );
+    if (!candidates.length) {
+      queuedFrames.clear();
+      return;
     }
-    pass1Index += KEYFRAME_STEP;
-    preloadPass1Keyframes();
-  };
-  img.onerror = () => {
-    pass1Index += KEYFRAME_STEP;
-    preloadPass1Keyframes();
-  };
-}
 
-// PASS 2: Background fill for intermediate frames
-let pass2Index = 1;
-function preloadPass2Fill() {
-  if (pass2Index > TOTAL_FRAMES) return;
-  if (images[pass2Index]) {
-    pass2Index++;
-    preloadPass2Fill();
-    return;
+    const idx = candidates.reduce((closest, index) =>
+      Math.abs(index - targetFrameIndex) < Math.abs(closest - targetFrameIndex) ? index : closest
+    );
+    queuedFrames.delete(idx);
+    loadingFrames.add(idx);
+
+    const img = new Image();
+    img.onload = () => {
+      loadingFrames.delete(idx);
+      images[idx] = img;
+      loadedFrameOrder.splice(
+        0,
+        loadedFrameOrder.length,
+        ...loadedFrameOrder.filter(index => images[index])
+      );
+      loadedFrameOrder.push(idx);
+
+      while (loadedFrameOrder.length > MAX_CACHED_FRAMES) {
+        const expiredPosition = loadedFrameOrder.findIndex(
+          index => Math.abs(index - targetFrameIndex) > FRAME_PREFETCH_RADIUS
+        );
+        if (expiredPosition < 0) break;
+        const [expiredIdx] = loadedFrameOrder.splice(expiredPosition, 1);
+        delete images[expiredIdx];
+      }
+
+      if (idx === 1) resizeCanvas();
+      renderFrame(getClosestLoadedImage(currentFrameIndex));
+      pumpFrameLoads();
+    };
+    img.onerror = () => {
+      loadingFrames.delete(idx);
+      failedFrames.add(idx);
+      console.error(`Unable to load hero frame: ${heroFrameFiles[idx - 1]}`);
+      pumpFrameLoads();
+    };
+    img.src = heroFrameFiles[idx - 1];
   }
-  const idx = pass2Index;
-  const img = new Image();
-  img.src = heroFrameFiles[idx - 1];
-  img.onload = () => {
-    images[idx] = img;
-    pass2Index++;
-    preloadPass2Fill();
-  };
-  img.onerror = () => {
-    pass2Index++;
-    preloadPass2Fill();
-  };
 }
 
-preloadPass1Keyframes();
+function loadFramesNearTarget() {
+  const center = Math.round(targetFrameIndex);
+  for (let offset = -FRAME_PREFETCH_RADIUS; offset <= FRAME_PREFETCH_RADIUS; offset++) {
+    const idx = center + offset;
+    if (
+      idx >= 1 &&
+      idx <= TOTAL_FRAMES &&
+      !images[idx] &&
+      !loadingFrames.has(idx) &&
+      !failedFrames.has(idx)
+    ) {
+      queuedFrames.add(idx);
+    }
+  }
+  pumpFrameLoads();
+}
 
-let currentFrameIndex = 1;
-let targetFrameIndex = 1;
+loadFramesNearTarget();
 
 function lerp(start, end, amt) {
   return (1 - amt) * start + amt * end;
@@ -145,6 +166,7 @@ function updateHeroScroll() {
   }
 
   targetFrameIndex = scrollFraction * (TOTAL_FRAMES - 1) + 1;
+  loadFramesNearTarget();
 }
 
 window.addEventListener("scroll", updateHeroScroll, { passive: true });
